@@ -38,8 +38,24 @@ Relevant non-secret settings:
 - `HERMES_OTEL_ENVIRONMENT`
 - `HERMES_OTEL_METRIC_EXPORT_INTERVAL_MS`
 - `HERMES_OTEL_CAPTURE_CONTENT` (default false)
+- `HERMES_OTEL_HYPOTHETICAL_COST_ENABLED` (default true for this experiment; independently disable with `false`)
 
 There is deliberately no environment template because this plugin needs no credentials of its own and safe defaults cover local experimentation.
+
+## Hypothetical API-equivalent cost
+
+Version 1.1 adds `hermes.gen_ai.hypothetical_api_cost` (USD), separate from the existing `hermes.gen_ai.estimated_cost`. It is a **counterfactual estimate, not an invoice**, and does not alter subscription-included semantics or actual spend reporting.
+
+The deliberately narrow `pricing.py` snapshot was observed **2026-08-06** for a Standard API scenario. It maps only exact `gpt-5.6-sol` and the official alias `gpt-5.6`; unknown models emit no amount and leave an `unmapped` status on the request span. Rates per million tokens are:
+
+| Context band | Uncached input | Cached input | Cache write | Output |
+|---|---:|---:|---:|---:|
+| Short (total request input <= 272,000) | $5.00 | $0.50 | $6.25 | $30.00 |
+| Long (total request input > 272,000) | $10.00 | $1.00 | $12.50 | $45.00 |
+
+Total request input is uncached input + cache reads + cache writes. Total output is charged once; reasoning tokens are a subset of output and are never added again. Hosted-tool fees are excluded. Low-cardinality provenance labels accompany the metric; source URL, observed date, formula/mapping versions, confidence, and the not-an-invoice warning remain on spans.
+
+Hermes' canonical `post_api_request` usage summary currently provides `cache_write_tokens` via normalized `CanonicalUsage`; the plugin uses that field and conservatively supports `cache_creation_input_tokens` as a compatibility fallback. If a provider/hook does not report cache writes, the plugin cannot infer them and treats them as zero. If the complete usage summary is absent, it emits no hypothetical amount and marks the span `missing_usage`.
 
 ## Tests
 

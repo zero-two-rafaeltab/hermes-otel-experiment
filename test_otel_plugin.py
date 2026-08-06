@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 import sys
+import types
 
 from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
@@ -16,7 +17,7 @@ sys.modules[spec.name] = plugin
 spec.loader.exec_module(plugin)
 
 
-def make_runtime():
+def make_runtime(*, hypothetical_cost_enabled=True):
     span_exporter = InMemorySpanExporter()
     metric_reader = InMemoryMetricReader()
     runtime = plugin.TelemetryRuntime(
@@ -25,6 +26,7 @@ def make_runtime():
         environment="test",
         span_exporter=span_exporter,
         metric_reader=metric_reader,
+        hypothetical_cost_enabled=hypothetical_cost_enabled,
     )
     plugin._runtime = runtime
     return runtime, span_exporter, metric_reader
@@ -167,3 +169,79 @@ def test_api_error_closes_span_with_error_status_and_metric():
 
     metrics = metric_points(metric_reader)
     assert metrics["hermes.gen_ai.errors"][0].value == 1
+
+
+def _complete_api(runtime, *, model="gpt-5.6-sol", usage=None, response="private response"):
+    kwargs = dict(
+        session_id="cost-session", turn_id="cost-turn", api_request_id="cost-request",
+        model=model, provider="openai-codex",
+    )
+    plugin.on_pre_api_request(**kwargs, request={"prompt": "private prompt"})
+    plugin.on_post_api_request(**kwargs, usage=usage, response=response, api_duration=0.1)
+
+
+def test_hypothetical_metric_is_nonzero_while_subscription_cost_stays_zero(monkeypatch):
+    usage_pricing = types.ModuleType("agent.usage_pricing")
+
+    class CanonicalUsage:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    usage_pricing.CanonicalUsage = CanonicalUsage
+    usage_pricing.estimate_usage_cost = lambda *args, **kwargs: types.SimpleNamespace(
+        status="included", source="custom_contract", amount_usd=0
+    )
+    agent = types.ModuleType("agent")
+    agent.usage_pricing = usage_pricing
+    monkeypatch.setitem(sys.modules, "agent", agent)
+    monkeypatch.setitem(sys.modules, "agent.usage_pricing", usage_pricing)
+
+    runtime, exporter, metric_reader = make_runtime()
+    _complete_api(runtime, model="gpt-5.6", usage={
+        "input_tokens": 100_000, "cache_read_tokens": 50_000,
+        "cache_write_tokens": 10_000, "output_tokens": 20_000,
+        "reasoning_tokens": 5_000,
+    })
+    runtime.force_flush()
+
+    metrics = metric_points(metric_reader)
+    assert metrics["hermes.gen_ai.estimated_cost"][0].value == 0
+    point = metrics["hermes.gen_ai.hypothetical_api_cost"][0]
+    assert point.value == 1.1875
+    assert point.attributes["hermes.pricing.priced_model"] == "gpt-5.6-sol"
+    assert point.attributes["hermes.pricing.mapping_method"] == "official_alias"
+    span = exporter.get_finished_spans()[0]
+    assert span.attributes["hermes.gen_ai.cost.status"] == "included"
+    assert span.attributes["hermes.gen_ai.hypothetical_api_cost.counterfactual"] is True
+    assert span.attributes["hermes.gen_ai.hypothetical_api_cost.hosted_tool_fees_excluded"] is True
+    assert not span.events
+    assert "private prompt" not in repr(span.attributes)
+    assert "private response" not in repr(span.attributes)
+
+
+def test_unknown_model_sets_unmapped_status_without_hypothetical_metric():
+    runtime, exporter, metric_reader = make_runtime()
+    _complete_api(runtime, model="gpt-unknown", usage={"input_tokens": 100})
+    runtime.force_flush()
+    assert "hermes.gen_ai.hypothetical_api_cost" not in metric_points(metric_reader)
+    assert exporter.get_finished_spans()[0].attributes[
+        "hermes.gen_ai.hypothetical_api_cost.estimation_status"
+    ] == "unmapped"
+
+
+def test_missing_usage_and_disabled_toggle_do_not_emit_hypothetical_metric():
+    runtime, exporter, metric_reader = make_runtime(hypothetical_cost_enabled=False)
+    _complete_api(runtime, usage={"input_tokens": 100})
+    runtime.force_flush()
+    assert "hermes.gen_ai.hypothetical_api_cost" not in metric_points(metric_reader)
+    assert exporter.get_finished_spans()[0].attributes[
+        "hermes.gen_ai.hypothetical_api_cost.estimation_status"
+    ] == "disabled"
+
+    runtime2, exporter2, metric_reader2 = make_runtime()
+    _complete_api(runtime2, usage=None)
+    runtime2.force_flush()
+    assert "hermes.gen_ai.hypothetical_api_cost" not in metric_points(metric_reader2)
+    assert exporter2.get_finished_spans()[0].attributes[
+        "hermes.gen_ai.hypothetical_api_cost.estimation_status"
+    ] == "missing_usage"

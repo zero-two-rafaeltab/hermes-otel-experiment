@@ -6,10 +6,13 @@ and estimated cost to an OTLP/HTTP collector. Content capture is opt-in.
 from __future__ import annotations
 
 import atexit
+import importlib.util
 import json
 import logging
 import os
+from pathlib import Path
 import socket
+import sys
 import threading
 from typing import Any, Optional
 
@@ -26,7 +29,7 @@ from opentelemetry.trace import Span, SpanKind, Status, StatusCode
 
 logger = logging.getLogger(__name__)
 
-PLUGIN_VERSION = "1.0.0"
+PLUGIN_VERSION = "1.1.0"
 _DEFAULT_ENDPOINT = "http://127.0.0.1:4318"
 _MAX_CONTENT_CHARS = 2_000
 
@@ -82,6 +85,21 @@ def _bounded_json(value: Any) -> str:
     if len(text) > _MAX_CONTENT_CHARS:
         return text[:_MAX_CONTENT_CHARS] + "...[truncated]"
     return text
+
+
+def _pricing_module() -> Any:
+    """Load the sibling pure module even when Hermes loads this file directly."""
+    module_name = "_hermes_otel_experiment_pricing_v1"
+    module = sys.modules.get(module_name)
+    if module is not None:
+        return module
+    spec = importlib.util.spec_from_file_location(module_name, Path(__file__).with_name("pricing.py"))
+    if spec is None or spec.loader is None:
+        raise ImportError("Could not load OTEL pricing module")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def _turn_key(kwargs: dict[str, Any]) -> tuple[str, str]:
@@ -160,6 +178,7 @@ class TelemetryRuntime:
         environment: str,
         endpoint: str = _DEFAULT_ENDPOINT,
         capture_content: bool = False,
+        hypothetical_cost_enabled: bool = True,
         span_exporter: Optional[SpanExporter] = None,
         metric_reader: Optional[MetricReader] = None,
     ) -> None:
@@ -175,6 +194,7 @@ class TelemetryRuntime:
             resource_attributes["deployment.environment.name"] = environment
         self.resource = Resource.create(resource_attributes)
         self.capture_content = capture_content
+        self.hypothetical_cost_enabled = hypothetical_cost_enabled
         self._lock = threading.RLock()
         self._turn_spans: dict[tuple[str, str], Span] = {}
         self._api_spans: dict[str, Span] = {}
@@ -214,6 +234,11 @@ class TelemetryRuntime:
         )
         self.cost_counter = meter.create_counter(
             "hermes.gen_ai.estimated_cost", unit="USD", description="Estimated model usage cost in USD"
+        )
+        self.hypothetical_cost_counter = meter.create_counter(
+            "hermes.gen_ai.hypothetical_api_cost",
+            unit="USD",
+            description="Counterfactual OpenAI Standard API-equivalent cost; not an invoice",
         )
         self.request_duration = meter.create_histogram(
             "hermes.gen_ai.request.duration", unit="s", description="Model API request duration"
@@ -306,7 +331,8 @@ class TelemetryRuntime:
             span = self._api_spans.pop(_api_key(kwargs), None)
         if span is None:
             return
-        usage = kwargs.get("usage") or {}
+        raw_usage = kwargs.get("usage")
+        usage = raw_usage or {}
         input_tokens = _integer(usage, "input_tokens", "prompt_tokens")
         output_tokens = _integer(usage, "output_tokens", "completion_tokens")
         cache_read = _integer(usage, "cache_read_tokens", "cache_read_input_tokens")
@@ -339,6 +365,7 @@ class TelemetryRuntime:
             if count:
                 self.token_counter.add(count, {**attrs, "gen_ai.token.type": token_type})
         self._record_estimated_cost(span, kwargs, usage, attrs)
+        self._record_hypothetical_api_cost(span, kwargs, raw_usage, attrs)
         span.set_status(Status(StatusCode.OK))
         span.end()
 
@@ -370,6 +397,74 @@ class TelemetryRuntime:
                 self.cost_counter.add(amount, {**attrs, "hermes.cost.status": cost.status})
         except Exception as exc:
             logger.debug("Could not estimate model cost: %s", exc)
+
+    def _record_hypothetical_api_cost(
+        self, span: Span, kwargs: dict[str, Any], usage: Any, attrs: dict[str, str]
+    ) -> None:
+        prefix = "hermes.gen_ai.hypothetical_api_cost"
+        if not self.hypothetical_cost_enabled:
+            span.set_attribute(f"{prefix}.estimation_status", "disabled")
+            return
+        if usage is None:
+            span.set_attribute(f"{prefix}.estimation_status", "missing_usage")
+            return
+        has_canonical_usage = (
+            (isinstance(usage, dict) and ("input_tokens" in usage or "output_tokens" in usage))
+            or hasattr(usage, "input_tokens")
+            or hasattr(usage, "output_tokens")
+        )
+        if not has_canonical_usage:
+            span.set_attribute(f"{prefix}.estimation_status", "missing_usage")
+            return
+        try:
+            pricing = _pricing_module()
+            canonical = pricing.Usage(
+                input_tokens=_integer(usage, "input_tokens"),
+                output_tokens=_integer(usage, "output_tokens"),
+                cache_read_tokens=_integer(usage, "cache_read_tokens", "cache_read_input_tokens"),
+                cache_write_tokens=_integer(usage, "cache_write_tokens", "cache_creation_input_tokens"),
+                reasoning_tokens=_integer(usage, "reasoning_tokens"),
+            )
+            result = pricing.estimate_hypothetical_api_cost(_string(kwargs.get("model")), canonical)
+            provenance = {
+                f"{prefix}.estimation_status": result.estimation_status,
+                f"{prefix}.counterfactual": result.counterfactual,
+                f"{prefix}.not_an_invoice": True,
+                f"{prefix}.scenario": result.scenario,
+                f"{prefix}.currency": result.currency,
+                f"{prefix}.pricing_version": result.pricing_version,
+                f"{prefix}.formula_version": result.formula_version,
+                f"{prefix}.mapping_version": result.mapping_version,
+                f"{prefix}.mapping_method": result.mapping_method,
+                f"{prefix}.confidence": result.confidence,
+                f"{prefix}.context_band": result.context_band,
+                f"{prefix}.priced_model": result.priced_model,
+                f"{prefix}.source_url": result.source_url,
+                f"{prefix}.observed_date": result.observed_date,
+                f"{prefix}.hosted_tool_fees_excluded": result.hosted_tool_fees_excluded,
+                f"{prefix}.formula": "uncached_input + cache_read + cache_write + total_output; reasoning included in output",
+            }
+            for name, value in provenance.items():
+                span.set_attribute(name, value)
+            if result.amount_usd is None:
+                return
+            amount = float(result.amount_usd)
+            span.set_attribute(f"{prefix}.usd", amount)
+            metric_attrs = {
+                **attrs,
+                "hermes.pricing.priced_model": result.priced_model,
+                "hermes.pricing.scenario": result.scenario,
+                "hermes.pricing.context_band": result.context_band,
+                "hermes.pricing.currency": result.currency,
+                "hermes.pricing.version": result.pricing_version,
+                "hermes.pricing.mapping_method": result.mapping_method,
+                "hermes.pricing.confidence": result.confidence,
+                "hermes.pricing.estimation_status": result.estimation_status,
+            }
+            self.hypothetical_cost_counter.add(amount, metric_attrs)
+        except Exception as exc:
+            span.set_attribute(f"{prefix}.estimation_status", "error")
+            logger.debug("Could not estimate hypothetical API cost: %s", exc)
 
     def api_error(self, **kwargs: Any) -> None:
         with self._lock:
@@ -465,6 +560,7 @@ def _get_runtime() -> TelemetryRuntime:
                 environment=_env("HERMES_OTEL_ENVIRONMENT", "zerotwo"),
                 endpoint=_env("HERMES_OTEL_ENDPOINT", _DEFAULT_ENDPOINT),
                 capture_content=_env_bool("HERMES_OTEL_CAPTURE_CONTENT", False),
+                hypothetical_cost_enabled=_env_bool("HERMES_OTEL_HYPOTHETICAL_COST_ENABLED", True),
             )
             logger.info(
                 "Hermes OpenTelemetry enabled: endpoint=%s service=%s content_capture=%s",
