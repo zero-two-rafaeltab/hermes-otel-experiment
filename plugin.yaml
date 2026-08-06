@@ -1,0 +1,13 @@
+name: otel
+version: "1.0.0"
+description: "Export Hermes turns, LLM requests, tool calls, token usage, latency, errors, and estimated cost to an OpenTelemetry collector. Prompt/response content capture is disabled by default."
+author: Zero Two
+hooks:
+  - pre_llm_call
+  - post_llm_call
+  - on_session_end
+  - pre_api_request
+  - post_api_request
+  - api_request_error
+  - pre_tool_call
+  - post_tool_call
