@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+from datetime import datetime
 from pathlib import Path
 import sys
 import types
@@ -17,7 +18,7 @@ sys.modules[spec.name] = plugin
 spec.loader.exec_module(plugin)
 
 
-def make_runtime(*, hypothetical_cost_enabled=True):
+def make_runtime(*, hypothetical_cost_enabled=True, **kwargs):
     span_exporter = InMemorySpanExporter()
     metric_reader = InMemoryMetricReader()
     runtime = plugin.TelemetryRuntime(
@@ -27,6 +28,7 @@ def make_runtime(*, hypothetical_cost_enabled=True):
         span_exporter=span_exporter,
         metric_reader=metric_reader,
         hypothetical_cost_enabled=hypothetical_cost_enabled,
+        **kwargs,
     )
     plugin._runtime = runtime
     return runtime, span_exporter, metric_reader
@@ -245,3 +247,65 @@ def test_missing_usage_and_disabled_toggle_do_not_emit_hypothetical_metric():
     assert exporter2.get_finished_spans()[0].attributes[
         "hermes.gen_ai.hypothetical_api_cost.estimation_status"
     ] == "missing_usage"
+
+
+def test_codex_remaining_limit_gauge_uses_new_window_metadata_and_poll_interval(monkeypatch):
+    clock = {"now": 1_000.0}
+    calls = []
+
+    def fetch(provider):
+        calls.append(provider)
+        return types.SimpleNamespace(
+            plan="Prolite",
+            windows=(
+                types.SimpleNamespace(
+                    label="Weekly limit",
+                    used_percent=21.0,
+                    reset_at=datetime.fromisoformat("2026-08-08T12:43:40+00:00"),
+                    window_seconds=604_800,
+                    limit_name="Codex",
+                    metered_feature=None,
+                ),
+                types.SimpleNamespace(
+                    label="GPT-5.3-Codex-Spark — Weekly limit",
+                    window_label="Weekly limit",
+                    used_percent=0.0,
+                    reset_at=None,
+                    window_seconds=604_800,
+                    limit_name="GPT-5.3-Codex-Spark",
+                    metered_feature="codex_bengalfox",
+                ),
+            ),
+        )
+
+    monkeypatch.setattr(plugin.time, "monotonic", lambda: clock["now"])
+    runtime, _, metric_reader = make_runtime(
+        codex_usage_enabled=True,
+        codex_usage_interval_seconds=300,
+        account_usage_fetcher=fetch,
+    )
+
+    metrics = metric_points(metric_reader)
+    points = metrics["hermes.codex.limit.remaining"]
+    assert calls == ["openai-codex"]
+    assert sorted(point.value for point in points) == [0.79, 1.0]
+    main = next(point for point in points if point.attributes["hermes.codex.limit.name"] == "Codex")
+    spark = next(
+        point for point in points
+        if point.attributes["hermes.codex.limit.name"] == "GPT-5.3-Codex-Spark"
+    )
+    assert main.attributes["hermes.codex.limit.window"] == "Weekly limit"
+    assert spark.attributes["hermes.codex.limit.window"] == "Weekly limit"
+    assert main.attributes["hermes.codex.limit.window_seconds"] == 604_800
+    assert "hermes.codex.limit.reset_at" not in main.attributes
+    reset_points = metrics["hermes.codex.limit.reset"]
+    assert len(reset_points) == 1
+    assert reset_points[0].value == 1_786_193_020.0
+
+    clock["now"] += 299
+    assert "hermes.codex.limit.remaining" not in metric_points(metric_reader)
+    assert calls == ["openai-codex"]
+
+    clock["now"] += 1
+    metric_points(metric_reader)
+    assert calls == ["openai-codex", "openai-codex"]

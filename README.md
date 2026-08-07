@@ -11,7 +11,7 @@ A local Hermes Agent plugin that translates lifecycle hooks into OpenTelemetry t
 - Hermes hook handlers delegate to one process-local `TelemetryRuntime`.
 - The runtime owns isolated OpenTelemetry tracer and meter providers.
 - Turn spans parent model-request and tool-call spans.
-- Counters and histograms report request, error, token, tool, duration, and Hermes-native estimated-cost data.
+- Counters, histograms, and gauges report request, error, token, tool, duration, cost, and Codex subscription-limit data.
 - OTLP/HTTP defaults to a collector on `http://127.0.0.1:4318`.
 
 No collector, Grafana dashboard, gateway, or Hermes core code belongs to this repository.
@@ -39,8 +39,16 @@ Relevant non-secret settings:
 - `HERMES_OTEL_METRIC_EXPORT_INTERVAL_MS`
 - `HERMES_OTEL_CAPTURE_CONTENT` (default false)
 - `HERMES_OTEL_HYPOTHETICAL_COST_ENABLED` (default true for this experiment; independently disable with `false`)
+- `HERMES_OTEL_CODEX_USAGE_ENABLED` (default true; independently disable with `false`)
+- `HERMES_OTEL_CODEX_USAGE_INTERVAL_SECONDS` (default `300`)
 
 There is deliberately no environment template because this plugin needs no credentials of its own and safe defaults cover local experimentation.
+
+## Codex subscription limits
+
+Version 1.2 polls Hermes' reusable OpenAI Codex account-usage probe every five minutes by default. It emits `hermes.codex.limit.remaining` as a 0–1 gauge for every returned main, code-review, or model-specific limit, labeled by plan, limit name, window description, duration, and stable metered feature when available. It also emits `hermes.codex.limit.reset` as a Unix timestamp gauge.
+
+Reset timestamps are deliberately metric values rather than labels. Some Codex limits report a moving reset timestamp, and using it as a Prometheus label would create a new series on every poll. Authentication remains owned by Hermes' existing Codex OAuth credential resolver; the plugin stores and exports no tokens.
 
 ## Hypothetical API-equivalent cost
 

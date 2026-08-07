@@ -1,6 +1,6 @@
 name: otel
-version: "1.1.0"
-description: "Export privacy-conscious Hermes OpenTelemetry traces and metrics, including a counterfactual OpenAI API-equivalent cost experiment. Content capture is disabled by default."
+version: "1.2.0"
+description: "Export privacy-conscious Hermes OpenTelemetry traces and metrics, including Codex subscription limits and a counterfactual OpenAI API-equivalent cost experiment. Content capture is disabled by default."
 author: Zero Two
 hooks:
   - pre_llm_call

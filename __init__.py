@@ -9,12 +9,14 @@ import atexit
 import importlib.util
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import socket
 import sys
 import threading
-from typing import Any, Optional
+import time
+from typing import Any, Callable, Optional
 
 from opentelemetry import trace
 from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
@@ -29,7 +31,7 @@ from opentelemetry.trace import Span, SpanKind, Status, StatusCode
 
 logger = logging.getLogger(__name__)
 
-PLUGIN_VERSION = "1.1.0"
+PLUGIN_VERSION = "1.2.0"
 _DEFAULT_ENDPOINT = "http://127.0.0.1:4318"
 _MAX_CONTENT_CHARS = 2_000
 
@@ -43,6 +45,13 @@ def _env_bool(name: str, default: bool = False) -> bool:
     if not value:
         return default
     return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(_env(name, str(default)))
+    except ValueError:
+        return default
 
 
 def _clean_endpoint(endpoint: str) -> str:
@@ -179,6 +188,9 @@ class TelemetryRuntime:
         endpoint: str = _DEFAULT_ENDPOINT,
         capture_content: bool = False,
         hypothetical_cost_enabled: bool = True,
+        codex_usage_enabled: bool = False,
+        codex_usage_interval_seconds: float = 300,
+        account_usage_fetcher: Optional[Callable[[str], Any]] = None,
         span_exporter: Optional[SpanExporter] = None,
         metric_reader: Optional[MetricReader] = None,
     ) -> None:
@@ -195,6 +207,13 @@ class TelemetryRuntime:
         self.resource = Resource.create(resource_attributes)
         self.capture_content = capture_content
         self.hypothetical_cost_enabled = hypothetical_cost_enabled
+        self.codex_usage_enabled = codex_usage_enabled
+        self.codex_usage_interval_seconds = max(1.0, float(codex_usage_interval_seconds))
+        self._account_usage_fetcher = account_usage_fetcher
+        self._codex_usage_last_attempt = float("-inf")
+        self._codex_usage_snapshot: Any = None
+        self._codex_usage_generation = 0
+        self._codex_usage_emitted_generation = {"remaining": 0, "reset": 0}
         self._lock = threading.RLock()
         self._turn_spans: dict[tuple[str, str], Span] = {}
         self._api_spans: dict[str, Span] = {}
@@ -255,10 +274,110 @@ class TelemetryRuntime:
             unit="{turn}",
             description="Currently active Hermes turns",
         )
+        self.codex_limit_remaining = None
+        self.codex_limit_reset = None
+        if self.codex_usage_enabled:
+            self.codex_limit_remaining = meter.create_observable_gauge(
+                "hermes.codex.limit.remaining",
+                callbacks=[self._observe_codex_limit_remaining],
+                unit="1",
+                description="Fraction of each OpenAI Codex subscription limit remaining",
+            )
+            self.codex_limit_reset = meter.create_observable_gauge(
+                "hermes.codex.limit.reset",
+                callbacks=[self._observe_codex_limit_reset],
+                unit="s",
+                description="Unix timestamp when each OpenAI Codex subscription limit resets",
+            )
 
     def _observe_active_turns(self, _options: Any) -> list[Observation]:
         with self._lock:
             return [Observation(len(self._turn_spans))]
+
+    def _refresh_codex_usage_if_due(self) -> None:
+        now = time.monotonic()
+        with self._lock:
+            if now - self._codex_usage_last_attempt < self.codex_usage_interval_seconds:
+                return
+            self._codex_usage_last_attempt = now
+        try:
+            fetcher = self._account_usage_fetcher
+            if fetcher is None:
+                from agent.account_usage import fetch_account_usage
+
+                fetcher = fetch_account_usage
+            snapshot = fetcher("openai-codex")
+        except Exception as exc:
+            logger.warning("Could not collect OpenAI Codex account limits: %s", exc)
+            snapshot = None
+        with self._lock:
+            self._codex_usage_snapshot = snapshot
+            self._codex_usage_generation += 1
+
+    def _codex_window_attributes(self, snapshot: Any, window: Any) -> dict[str, Any]:
+        attrs: dict[str, Any] = {
+            "gen_ai.provider.name": "openai-codex",
+            "hermes.codex.limit.name": _string(getattr(window, "limit_name", None))
+            or _string(window.label),
+            "hermes.codex.limit.window": _string(getattr(window, "window_label", None))
+            or _string(window.label),
+        }
+        plan = _string(getattr(snapshot, "plan", None))
+        if plan:
+            attrs["hermes.account.plan"] = plan
+        window_seconds = getattr(window, "window_seconds", None)
+        if isinstance(window_seconds, int) and window_seconds > 0:
+            attrs["hermes.codex.limit.window_seconds"] = window_seconds
+        metered_feature = _string(getattr(window, "metered_feature", None))
+        if metered_feature:
+            attrs["hermes.codex.limit.metered_feature"] = metered_feature
+        return attrs
+
+    def _codex_snapshot_for_metric(self, metric: str) -> Any:
+        self._refresh_codex_usage_if_due()
+        with self._lock:
+            generation = self._codex_usage_generation
+            if generation == self._codex_usage_emitted_generation[metric]:
+                return None
+            self._codex_usage_emitted_generation[metric] = generation
+            return self._codex_usage_snapshot
+
+    def _observe_codex_limit_remaining(self, _options: Any) -> list[Observation]:
+        snapshot = self._codex_snapshot_for_metric("remaining")
+        if snapshot is None:
+            return []
+        observations: list[Observation] = []
+        for window in snapshot.windows:
+            used_percent = getattr(window, "used_percent", None)
+            if not isinstance(used_percent, (int, float)) or not math.isfinite(used_percent):
+                continue
+            remaining = max(0.0, min(1.0, 1.0 - float(used_percent) / 100.0))
+            observations.append(
+                Observation(remaining, attributes=self._codex_window_attributes(snapshot, window))
+            )
+        return observations
+
+    def _observe_codex_limit_reset(self, _options: Any) -> list[Observation]:
+        snapshot = self._codex_snapshot_for_metric("reset")
+        if snapshot is None:
+            return []
+        observations: list[Observation] = []
+        for window in snapshot.windows:
+            reset_at = getattr(window, "reset_at", None)
+            if reset_at is None:
+                continue
+            try:
+                reset_timestamp = float(reset_at.timestamp())
+            except (AttributeError, TypeError, ValueError, OverflowError):
+                continue
+            if math.isfinite(reset_timestamp):
+                observations.append(
+                    Observation(
+                        reset_timestamp,
+                        attributes=self._codex_window_attributes(snapshot, window),
+                    )
+                )
+        return observations
 
     def _parent_context(self, kwargs: dict[str, Any]) -> Any:
         with self._lock:
@@ -561,6 +680,10 @@ def _get_runtime() -> TelemetryRuntime:
                 endpoint=_env("HERMES_OTEL_ENDPOINT", _DEFAULT_ENDPOINT),
                 capture_content=_env_bool("HERMES_OTEL_CAPTURE_CONTENT", False),
                 hypothetical_cost_enabled=_env_bool("HERMES_OTEL_HYPOTHETICAL_COST_ENABLED", True),
+                codex_usage_enabled=_env_bool("HERMES_OTEL_CODEX_USAGE_ENABLED", True),
+                codex_usage_interval_seconds=_env_float(
+                    "HERMES_OTEL_CODEX_USAGE_INTERVAL_SECONDS", 300
+                ),
             )
             logger.info(
                 "Hermes OpenTelemetry enabled: endpoint=%s service=%s content_capture=%s",
