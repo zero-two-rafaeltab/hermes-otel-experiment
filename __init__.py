@@ -212,8 +212,6 @@ class TelemetryRuntime:
         self._account_usage_fetcher = account_usage_fetcher
         self._codex_usage_last_attempt = float("-inf")
         self._codex_usage_snapshot: Any = None
-        self._codex_usage_generation = 0
-        self._codex_usage_emitted_generation = {"remaining": 0, "reset": 0}
         self._lock = threading.RLock()
         self._turn_spans: dict[tuple[str, str], Span] = {}
         self._api_spans: dict[str, Span] = {}
@@ -312,7 +310,6 @@ class TelemetryRuntime:
             snapshot = None
         with self._lock:
             self._codex_usage_snapshot = snapshot
-            self._codex_usage_generation += 1
 
     def _codex_window_attributes(self, snapshot: Any, window: Any) -> dict[str, Any]:
         attrs: dict[str, Any] = {
@@ -333,17 +330,13 @@ class TelemetryRuntime:
             attrs["hermes.codex.limit.metered_feature"] = metered_feature
         return attrs
 
-    def _codex_snapshot_for_metric(self, metric: str) -> Any:
+    def _codex_snapshot(self) -> Any:
         self._refresh_codex_usage_if_due()
         with self._lock:
-            generation = self._codex_usage_generation
-            if generation == self._codex_usage_emitted_generation[metric]:
-                return None
-            self._codex_usage_emitted_generation[metric] = generation
             return self._codex_usage_snapshot
 
     def _observe_codex_limit_remaining(self, _options: Any) -> list[Observation]:
-        snapshot = self._codex_snapshot_for_metric("remaining")
+        snapshot = self._codex_snapshot()
         if snapshot is None:
             return []
         observations: list[Observation] = []
@@ -358,7 +351,7 @@ class TelemetryRuntime:
         return observations
 
     def _observe_codex_limit_reset(self, _options: Any) -> list[Observation]:
-        snapshot = self._codex_snapshot_for_metric("reset")
+        snapshot = self._codex_snapshot()
         if snapshot is None:
             return []
         observations: list[Observation] = []

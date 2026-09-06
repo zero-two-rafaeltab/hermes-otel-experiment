@@ -303,7 +303,11 @@ def test_codex_remaining_limit_gauge_uses_new_window_metadata_and_poll_interval(
     assert reset_points[0].value == 1_786_193_020.0
 
     clock["now"] += 299
-    assert "hermes.codex.limit.remaining" not in metric_points(metric_reader)
+    cached_metrics = metric_points(metric_reader)
+    assert sorted(
+        point.value for point in cached_metrics["hermes.codex.limit.remaining"]
+    ) == [0.79, 1.0]
+    assert len(cached_metrics["hermes.codex.limit.reset"]) == 1
     assert calls == ["openai-codex"]
 
     clock["now"] += 1
