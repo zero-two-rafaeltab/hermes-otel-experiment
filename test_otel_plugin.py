@@ -189,12 +189,16 @@ def test_hypothetical_metric_is_nonzero_while_subscription_cost_stays_zero(monke
         def __init__(self, **kwargs):
             self.kwargs = kwargs
 
-    usage_pricing.CanonicalUsage = CanonicalUsage
-    usage_pricing.estimate_usage_cost = lambda *args, **kwargs: types.SimpleNamespace(
-        status="included", source="custom_contract", amount_usd=0
+    setattr(usage_pricing, "CanonicalUsage", CanonicalUsage)
+    setattr(
+        usage_pricing,
+        "estimate_usage_cost",
+        lambda *args, **kwargs: types.SimpleNamespace(
+            status="included", source="custom_contract", amount_usd=0
+        ),
     )
     agent = types.ModuleType("agent")
-    agent.usage_pricing = usage_pricing
+    setattr(agent, "usage_pricing", usage_pricing)
     monkeypatch.setitem(sys.modules, "agent", agent)
     monkeypatch.setitem(sys.modules, "agent.usage_pricing", usage_pricing)
 
@@ -209,7 +213,7 @@ def test_hypothetical_metric_is_nonzero_while_subscription_cost_stays_zero(monke
     metrics = metric_points(metric_reader)
     assert metrics["hermes.gen_ai.estimated_cost"][0].value == 0
     point = metrics["hermes.gen_ai.hypothetical_api_cost"][0]
-    assert point.value == 1.1875
+    assert point.value == 0.87
     assert point.attributes["hermes.pricing.priced_model"] == "gpt-5.6-sol"
     assert point.attributes["hermes.pricing.mapping_method"] == "official_alias"
     span = exporter.get_finished_spans()[0]
@@ -221,6 +225,26 @@ def test_hypothetical_metric_is_nonzero_while_subscription_cost_stays_zero(monke
     assert "private response" not in repr(span.attributes)
 
 
+def test_gpt_6_astra_emits_a_dashboard_compatible_hypothetical_metric():
+    runtime, exporter, metric_reader = make_runtime()
+    _complete_api(
+        runtime,
+        model="gpt-6-astra",
+        usage={"input_tokens": 100_000, "output_tokens": 20_000},
+    )
+    runtime.force_flush()
+
+    point = metric_points(metric_reader)["hermes.gen_ai.hypothetical_api_cost"][0]
+    assert point.value == 2.0
+    assert point.attributes["hermes.pricing.priced_model"] == "gpt-6-astra"
+    assert point.attributes["hermes.pricing.version"] == "openai-standard-2026-09-13-v1"
+    span = exporter.get_finished_spans()[0]
+    assert span.attributes is not None
+    assert span.attributes[
+        "hermes.gen_ai.hypothetical_api_cost.estimation_status"
+    ] == "estimated"
+
+
 def test_unknown_model_sets_unmapped_status_without_hypothetical_metric():
     runtime, exporter, metric_reader = make_runtime()
     _complete_api(runtime, model="gpt-unknown", usage={"input_tokens": 100})
@@ -229,6 +253,53 @@ def test_unknown_model_sets_unmapped_status_without_hypothetical_metric():
     assert exporter.get_finished_spans()[0].attributes[
         "hermes.gen_ai.hypothetical_api_cost.estimation_status"
     ] == "unmapped"
+
+
+def test_legacy_usage_names_still_emit_hypothetical_cost(monkeypatch):
+    captured = []
+    usage_pricing = types.ModuleType("agent.usage_pricing")
+
+    class CanonicalUsage:
+        def __init__(self, **kwargs):
+            captured.append(kwargs)
+
+    setattr(usage_pricing, "CanonicalUsage", CanonicalUsage)
+    setattr(
+        usage_pricing,
+        "estimate_usage_cost",
+        lambda *args, **kwargs: types.SimpleNamespace(
+            status="included", source="custom_contract", amount_usd=0
+        ),
+    )
+    agent = types.ModuleType("agent")
+    setattr(agent, "usage_pricing", usage_pricing)
+    monkeypatch.setitem(sys.modules, "agent", agent)
+    monkeypatch.setitem(sys.modules, "agent.usage_pricing", usage_pricing)
+
+    runtime, exporter, metric_reader = make_runtime()
+    _complete_api(
+        runtime,
+        model="gpt-3.5-turbo",
+        usage={"prompt_tokens": 100_000, "completion_tokens": 100_000},
+    )
+    runtime.force_flush()
+
+    point = metric_points(metric_reader)["hermes.gen_ai.hypothetical_api_cost"][0]
+    assert point.value == 0.2
+    assert captured == [{
+        "input_tokens": 100_000,
+        "output_tokens": 100_000,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": 0,
+        "request_count": 1,
+    }]
+    span = exporter.get_finished_spans()[0]
+    assert span.attributes is not None
+    assert span.attributes["gen_ai.usage.input_tokens"] == 100_000
+    assert span.attributes[
+        "hermes.gen_ai.hypothetical_api_cost.estimation_status"
+    ] == "estimated"
 
 
 def test_missing_usage_and_disabled_toggle_do_not_emit_hypothetical_metric():

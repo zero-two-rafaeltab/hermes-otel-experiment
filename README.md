@@ -54,12 +54,13 @@ Reset timestamps are deliberately metric values rather than labels. Some Codex l
 
 Version 1.1 adds `hermes.gen_ai.hypothetical_api_cost` (USD), separate from the existing `hermes.gen_ai.estimated_cost`. It is a **counterfactual estimate, not an invoice**, and does not alter subscription-included semantics or actual spend reporting.
 
-The deliberately narrow `pricing.py` snapshot was observed **2026-08-06** for a Standard API scenario. It maps only exact `gpt-5.6-sol` and the official alias `gpt-5.6`; unknown models emit no amount and leave an `unmapped` status on the request span. Rates per million tokens are:
+The versioned `pricing.py` catalog was refreshed from OpenAI's official pricing and model documentation on **2026-09-13**. It covers all current and still-priced legacy text/reasoning model IDs whose cost can be calculated honestly from Hermes' canonical input, cached-input, cache-write, and output token buckets. This includes GPT-6 Astra; GPT-5.6 Sol, Terra, Luna, and Cyber; GPT-5.5/5.4/5.2/5.1/5 families; GPT-4.1 and GPT-4o families; o-series models; current Codex, ChatGPT, search, and deep-research text models; embeddings; moderation; and explicitly documented aliases and dated snapshots.
 
-| Context band | Uncached input | Cached input | Cache write | Output |
-|---|---:|---:|---:|---:|
-| Short (total request input <= 272,000) | $5.00 | $0.50 | $6.25 | $30.00 |
-| Long (total request input > 272,000) | $10.00 | $1.00 | $12.50 | $45.00 |
+The catalog uses the **Standard API** scenario. Models with documented long-context pricing switch the entire request to the long rate only above 272,000 total request-input tokens. A published dash is represented as an unavailable rate: if telemetry unexpectedly contains that token bucket, the plugin emits no amount and records `rate_unavailable` rather than treating it as free. Unknown model IDs remain `unmapped`.
+
+Models whose complete price requires dimensions Hermes does not currently capture remain intentionally unsupported: realtime/audio/image/video models, duration-priced transcription and Live sessions, character-priced TTS, and hosted-tool/storage/container charges. Deep-research estimates cover model tokens only; the existing `hosted_tool_fees_excluded` provenance flag remains true.
+
+GPT-5.6 Sol's current promotional Standard rates are $4.00/M uncached input, $0.40/M cached input, $5.00/M cache writes, and $20.00/M output for short-context requests. The complete per-model rate card and aliases live in `pricing.py`; the primary source is https://developers.openai.com/api/docs/pricing.
 
 Total request input is uncached input + cache reads + cache writes. Total output is charged once; reasoning tokens are a subset of output and are never added again. Hosted-tool fees are excluded. Low-cardinality provenance labels accompany the metric; source URL, observed date, formula/mapping versions, confidence, and the not-an-invoice warning remain on spans.
 

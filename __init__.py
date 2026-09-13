@@ -31,7 +31,7 @@ from opentelemetry.trace import Span, SpanKind, Status, StatusCode
 
 logger = logging.getLogger(__name__)
 
-PLUGIN_VERSION = "1.2.0"
+PLUGIN_VERSION = "1.3.0"
 _DEFAULT_ENDPOINT = "http://127.0.0.1:4318"
 _MAX_CONTENT_CHARS = 2_000
 
@@ -488,10 +488,14 @@ class TelemetryRuntime:
             from agent.usage_pricing import CanonicalUsage, estimate_usage_cost
 
             canonical = CanonicalUsage(
-                input_tokens=_integer(usage, "input_tokens"),
-                output_tokens=_integer(usage, "output_tokens"),
-                cache_read_tokens=_integer(usage, "cache_read_tokens"),
-                cache_write_tokens=_integer(usage, "cache_write_tokens"),
+                input_tokens=_integer(usage, "input_tokens", "prompt_tokens"),
+                output_tokens=_integer(usage, "output_tokens", "completion_tokens"),
+                cache_read_tokens=_integer(
+                    usage, "cache_read_tokens", "cache_read_input_tokens"
+                ),
+                cache_write_tokens=_integer(
+                    usage, "cache_write_tokens", "cache_creation_input_tokens"
+                ),
                 reasoning_tokens=_integer(usage, "reasoning_tokens"),
                 request_count=_integer(usage, "request_count") or 1,
             )
@@ -521,9 +525,23 @@ class TelemetryRuntime:
             span.set_attribute(f"{prefix}.estimation_status", "missing_usage")
             return
         has_canonical_usage = (
-            (isinstance(usage, dict) and ("input_tokens" in usage or "output_tokens" in usage))
-            or hasattr(usage, "input_tokens")
-            or hasattr(usage, "output_tokens")
+            (
+                isinstance(usage, dict)
+                and any(
+                    name in usage
+                    for name in (
+                        "input_tokens", "output_tokens",
+                        "prompt_tokens", "completion_tokens",
+                    )
+                )
+            )
+            or any(
+                hasattr(usage, name)
+                for name in (
+                    "input_tokens", "output_tokens",
+                    "prompt_tokens", "completion_tokens",
+                )
+            )
         )
         if not has_canonical_usage:
             span.set_attribute(f"{prefix}.estimation_status", "missing_usage")
@@ -531,8 +549,8 @@ class TelemetryRuntime:
         try:
             pricing = _pricing_module()
             canonical = pricing.Usage(
-                input_tokens=_integer(usage, "input_tokens"),
-                output_tokens=_integer(usage, "output_tokens"),
+                input_tokens=_integer(usage, "input_tokens", "prompt_tokens"),
+                output_tokens=_integer(usage, "output_tokens", "completion_tokens"),
                 cache_read_tokens=_integer(usage, "cache_read_tokens", "cache_read_input_tokens"),
                 cache_write_tokens=_integer(usage, "cache_write_tokens", "cache_creation_input_tokens"),
                 reasoning_tokens=_integer(usage, "reasoning_tokens"),
