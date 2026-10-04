@@ -66,6 +66,35 @@ Total request input is uncached input + cache reads + cache writes. Total output
 
 Hermes' canonical `post_api_request` usage summary currently provides `cache_write_tokens` via normalized `CanonicalUsage`; the plugin uses that field and conservatively supports `cache_creation_input_tokens` as a compatibility fallback. If a provider/hook does not report cache writes, the plugin cannot infer them and treats them as zero. If the complete usage summary is absent, it emits no hypothetical amount and marks the span `missing_usage`.
 
+## Named skill loads
+
+Version 1.4 emits `hermes.skill.loads`, a monotonic counter with unit `{load}`,
+and a `skill.load` span for successful explicit main `skill_view` calls only.
+Both have exactly four data attributes: `runtime=hermes`, `skill_name` from
+the successful result's canonical name, `load_kind=explicit`, and `status=ok`.
+Plugin-qualified names retain their namespace and case. Names outside the
+identifier grammar `[A-Za-z0-9_-]+(?::[A-Za-z0-9_-]+)?` fail closed, never
+truncate or collapse. No input name is used as a fallback.
+
+Reference retrieval, listings, creation, failed loads, preloads and slash-command
+loads outside tool dispatch do not count. Missing stable call identity or missing
+main-result shape also fails closed. The span timestamp is the wall-clock time
+of the original successful completion-hook observation, since the current
+runtime supplies duration but no event wall-clock timestamp. Flush preserves it.
+The span has no events and never exports content, paths or argument/result blobs,
+even if content capture is enabled for other instrumentation.
+
+Replay deduplication stores only `(session_id, tool_call_id)` in a locked,
+process-local FIFO window of 4096 successful calls. Distinct intentional calls
+count again. Callbacks older than this window can count again; deduplication
+does not persist across process restarts. Neither identity becomes a metric
+label. Existing resource attributes and trace correlation remain unchanged.
+
+There is no backfill. Historical activity before activation is unavailable.
+This deployment covers new default-profile processes that load the plugin.
+Already-running processes retain their imported version until an approved
+restart. Named profiles without this plugin are not covered.
+
 ## Tests
 
 ```bash
