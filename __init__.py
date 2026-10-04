@@ -6,6 +6,8 @@ and estimated cost to an OTLP/HTTP collector. Content capture is opt-in.
 from __future__ import annotations
 
 import atexit
+from collections import OrderedDict
+import re
 import importlib.util
 import json
 import logging
@@ -31,7 +33,7 @@ from opentelemetry.trace import Span, SpanKind, Status, StatusCode
 
 logger = logging.getLogger(__name__)
 
-PLUGIN_VERSION = "1.3.0"
+PLUGIN_VERSION = "1.4.0"
 _DEFAULT_ENDPOINT = "http://127.0.0.1:4318"
 _MAX_CONTENT_CHARS = 2_000
 
@@ -216,6 +218,9 @@ class TelemetryRuntime:
         self._turn_spans: dict[tuple[str, str], Span] = {}
         self._api_spans: dict[str, Span] = {}
         self._tool_spans: dict[str, Span] = {}
+        # Identity only, never arguments/results; process-local bounded replay window.
+        self._skill_load_seen: OrderedDict[tuple[str, str], None] = OrderedDict()
+        self._skill_load_seen_limit = 4096
 
         if span_exporter is None:
             base = _clean_endpoint(endpoint)
@@ -262,6 +267,9 @@ class TelemetryRuntime:
         )
         self.tool_counter = meter.create_counter(
             "hermes.tool.calls", unit="{call}", description="Hermes tool calls"
+        )
+        self.skill_load_counter = meter.create_counter(
+            "hermes.skill.loads", unit="{load}", description="Successful explicit main skill loads"
         )
         self.tool_duration = meter.create_histogram(
             "hermes.tool.duration", unit="s", description="Hermes tool call duration"
@@ -641,6 +649,7 @@ class TelemetryRuntime:
             previous.end()
 
     def post_tool(self, **kwargs: Any) -> None:
+        self._record_skill_load(kwargs)
         with self._lock:
             span = self._tool_spans.pop(_tool_key(kwargs), None)
         if span is None:
@@ -661,6 +670,53 @@ class TelemetryRuntime:
         else:
             span.set_status(Status(StatusCode.ERROR, status))
         span.end()
+
+    def _record_skill_load(self, kwargs: dict[str, Any]) -> None:
+        """Select only canonical metadata from a successful main skill_view result.
+
+        Hooks have no wall-clock event timestamp: receipt time is the original
+        completion observation, not flush time. Missing stable identity fails closed.
+        """
+        if kwargs.get("tool_name") != "skill_view" or kwargs.get("status") != "ok":
+            return
+        args = kwargs.get("args")
+        if not isinstance(args, dict) or args.get("file_path"):
+            return
+        call_id = kwargs.get("tool_call_id")
+        if not isinstance(call_id, str) or not call_id:
+            return
+        result = kwargs.get("result")
+        if isinstance(result, str):
+            try:
+                result = json.loads(result)
+            except (ValueError, TypeError):
+                return
+        if not isinstance(result, dict) or result.get("success") is not True or result.get("error"):
+            return
+        # Main loads have content; support-file responses are not main loads.
+        if "content" not in result:
+            return
+        name = result.get("name")
+        # No lowercasing, truncation or guessed name from user arguments. Reject
+        # paths/control characters rather than exporting arbitrary content.
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_-]+(?::[A-Za-z0-9_-]+)?", name):
+            return
+        event_ns = time.time_ns()
+        identity = (_string(kwargs.get("session_id")), call_id)
+        attrs = {"runtime": "hermes", "skill_name": name, "load_kind": "explicit", "status": "ok"}
+        with self._lock:
+            if identity in self._skill_load_seen:
+                return
+            self._skill_load_seen[identity] = None
+            if len(self._skill_load_seen) > self._skill_load_seen_limit:
+                self._skill_load_seen.popitem(last=False)
+            self.skill_load_counter.add(1, attrs)
+            span = self.tracer.start_span(
+                "skill.load", context=self._parent_context(kwargs),
+                kind=SpanKind.INTERNAL, attributes=attrs, start_time=event_ns,
+            )
+            span.set_status(Status(StatusCode.OK))
+            span.end(end_time=event_ns)
 
     def force_flush(self, timeout_millis: int = 10_000) -> bool:
         traces_ok = self.tracer_provider.force_flush(timeout_millis=timeout_millis)
